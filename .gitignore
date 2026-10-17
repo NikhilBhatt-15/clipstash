@@ -1,0 +1,6 @@
+target/
+*.exe
+*.pdb
+*.db
+*.db-wal
+*.db-shm
