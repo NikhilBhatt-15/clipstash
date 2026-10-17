@@ -1,8 +1,9 @@
-//! Plaintext clipboard history in SQLite.
+//! Clipboard history in SQLite: text and images.
 //!
-//! One row per distinct text. Copying something already in history moves it
-//! back to the top instead of adding a duplicate. Unpinned rows are pruned to
-//! the newest `keep` after every insert; pinned rows are never pruned and
+//! One row per distinct text or image. Copying something already in history
+//! moves it back to the top instead of adding a duplicate; images are keyed by
+//! a hash of their pixels. Unpinned text and unpinned images are pruned
+//! separately (images are much larger); pinned rows are never pruned and
 //! always sort first.
 
 use rusqlite::{params_from_iter, Connection, OptionalExtension};
@@ -12,18 +13,38 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Larger copies (log dumps, whole files) are not worth keeping as history.
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
+/// Images whose PNG is larger than this are skipped.
+pub const MAX_IMAGE_BYTES: usize = 40 * 1024 * 1024;
+const DEFAULT_KEEP_IMAGES: usize = 50;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub w: u32,
+    pub h: u32,
+    /// Size of the stored PNG.
+    pub bytes: usize,
+    /// Small PNG for the list.
+    pub thumb: Vec<u8>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Clip {
     pub id: i64,
+    /// For images, an internal key ("\u{1}image:<hash>"); never shown.
     pub text: String,
     pub pinned: bool,
     pub used_ms: i64,
+    pub image: Option<ImageInfo>,
 }
 
 pub struct Store {
     conn: Connection,
     keep: Cell<usize>,
+    keep_images: Cell<usize>,
+}
+
+pub fn image_key(hash: u64) -> String {
+    format!("\u{1}image:{hash:016x}")
 }
 
 pub fn now_ms() -> i64 {
@@ -59,7 +80,47 @@ impl Store {
                  PRAGMA user_version = 1;",
             )?;
         }
-        Ok(Self { conn, keep: Cell::new(keep) })
+        if version < 2 {
+            conn.execute_batch(
+                "ALTER TABLE clips ADD COLUMN kind  TEXT    NOT NULL DEFAULT 'text';
+                 ALTER TABLE clips ADD COLUMN image BLOB;
+                 ALTER TABLE clips ADD COLUMN thumb BLOB;
+                 ALTER TABLE clips ADD COLUMN img_w INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE clips ADD COLUMN img_h INTEGER NOT NULL DEFAULT 0;
+                 PRAGMA user_version = 2;",
+            )?;
+        }
+        Ok(Self { conn, keep: Cell::new(keep), keep_images: Cell::new(DEFAULT_KEEP_IMAGES) })
+    }
+
+    /// Records an image copy, keyed by `hash` so re-copying the same pixels
+    /// just moves the existing entry up.
+    pub fn add_image(&self, png: &[u8], thumb: &[u8], w: u32, h: u32, hash: u64) -> rusqlite::Result<bool> {
+        if png.len() > MAX_IMAGE_BYTES {
+            return Ok(false);
+        }
+        let now = self.next_stamp()?;
+        self.conn.execute(
+            "INSERT INTO clips (text, created_ms, used_ms, kind, image, thumb, img_w, img_h)
+                 VALUES (?1, ?2, ?2, 'image', ?3, ?4, ?5, ?6)
+             ON CONFLICT (text) DO UPDATE SET used_ms = excluded.used_ms",
+            (image_key(hash), now, png, thumb, w, h),
+        )?;
+        self.prune()?;
+        Ok(true)
+    }
+
+    /// Full PNG of an image entry (not loaded by `search`, which only reads thumbnails).
+    pub fn image_png(&self, id: i64) -> rusqlite::Result<Option<Vec<u8>>> {
+        self.conn
+            .query_row("SELECT image FROM clips WHERE id = ?1 AND kind = 'image'", [id], |r| r.get(0))
+            .optional()
+            .map(Option::flatten)
+    }
+
+    pub fn set_keep_images(&self, keep: usize) -> rusqlite::Result<()> {
+        self.keep_images.set(keep);
+        self.prune()
     }
 
     /// Records a copy. Returns false when the text is not worth storing.
@@ -83,11 +144,13 @@ impl Store {
     }
 
     fn prune(&self) -> rusqlite::Result<()> {
-        self.conn.execute(
-            "DELETE FROM clips WHERE pinned = 0 AND id NOT IN
-                 (SELECT id FROM clips WHERE pinned = 0 ORDER BY used_ms DESC LIMIT ?1)",
-            [self.keep.get() as i64],
-        )?;
+        for (kind, keep) in [("text", self.keep.get()), ("image", self.keep_images.get())] {
+            self.conn.execute(
+                "DELETE FROM clips WHERE pinned = 0 AND kind = ?1 AND id NOT IN
+                     (SELECT id FROM clips WHERE pinned = 0 AND kind = ?1 ORDER BY used_ms DESC LIMIT ?2)",
+                (kind, keep as i64),
+            )?;
+        }
         Ok(())
     }
 
@@ -115,19 +178,37 @@ impl Store {
     }
 
     /// Pinned first, then most recently used, matching every
-    /// whitespace-separated term (case-insensitive for ASCII).
+    /// whitespace-separated term (case-insensitive for ASCII). Images match
+    /// on "image", "screenshot", "picture" and their size, e.g. "1920x1080".
     pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Clip>> {
         let terms: Vec<String> = query.split_whitespace().map(|t| format!("%{}%", escape_like(t))).collect();
-        let mut sql = String::from("SELECT id, text, pinned, used_ms FROM clips");
+        let mut sql = String::from(
+            "SELECT id, text, pinned, used_ms, kind, img_w, img_h, length(image), thumb FROM clips",
+        );
         for i in 0..terms.len() {
             sql += if i == 0 { " WHERE " } else { " AND " };
-            sql += &format!("text LIKE ?{} ESCAPE '\\'", i + 1);
+            sql += &format!(
+                "(CASE kind WHEN 'image' THEN 'image screenshot picture ' || img_w || 'x' || img_h ELSE text END)
+                 LIKE ?{} ESCAPE '\\'",
+                i + 1
+            );
         }
         sql += &format!(" ORDER BY pinned DESC, used_ms DESC LIMIT {limit}");
 
         let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params_from_iter(terms.iter()), |r| {
-            Ok(Clip { id: r.get(0)?, text: r.get(1)?, pinned: r.get(2)?, used_ms: r.get(3)? })
+            let kind: String = r.get(4)?;
+            let image = if kind == "image" {
+                Some(ImageInfo {
+                    w: r.get(5)?,
+                    h: r.get(6)?,
+                    bytes: r.get::<_, Option<i64>>(7)?.unwrap_or(0) as usize,
+                    thumb: r.get::<_, Option<Vec<u8>>>(8)?.unwrap_or_default(),
+                })
+            } else {
+                None
+            };
+            Ok(Clip { id: r.get(0)?, text: r.get(1)?, pinned: r.get(2)?, used_ms: r.get(3)?, image })
         })?;
         rows.collect()
     }
@@ -271,6 +352,38 @@ mod tests {
         }
         assert_eq!(texts(&s.search("0%", 10).unwrap()), ["100% done"]);
         assert_eq!(texts(&s.search("a_b", 10).unwrap()), ["a_b"]);
+    }
+
+    #[test]
+    fn images_dedupe_prune_separately_and_search_by_label() {
+        let s = Store::open_in_memory(2).unwrap();
+        s.set_keep_images(2).unwrap();
+        s.add("some text").unwrap();
+        assert!(s.add_image(b"png-a", b"thumb-a", 1920, 1080, 0xaaaa).unwrap());
+        s.add_image(b"png-b", b"thumb-b", 800, 600, 0xbbbb).unwrap();
+        s.add_image(b"png-a", b"thumb-a", 1920, 1080, 0xaaaa).unwrap(); // same pixels again
+        let list = all(&s);
+        assert_eq!(list.len(), 3);
+        let top = list[0].image.as_ref().unwrap();
+        assert_eq!((top.w, top.h, top.bytes, top.thumb.as_slice()), (1920, 1080, 5, &b"thumb-a"[..]));
+        assert!(list[2].image.is_none());
+
+        // A third distinct image evicts the oldest image, not the text.
+        s.add_image(b"png-c", b"thumb-c", 10, 10, 0xcccc).unwrap();
+        let list = all(&s);
+        assert_eq!(list.iter().filter(|c| c.image.is_some()).count(), 2);
+        assert!(list.iter().any(|c| c.text == "some text"));
+
+        assert_eq!(s.search("screenshot", 10).unwrap().len(), 2);
+        assert_eq!(s.search("1920x1080", 10).unwrap().len(), 1);
+        assert_eq!(s.search("text", 10).unwrap().len(), 1);
+        // The internal key (hex hash) must not be searchable.
+        assert!(s.search("aaaa", 10).unwrap().is_empty());
+
+        let id = s.search("1920x1080", 1).unwrap()[0].id;
+        assert_eq!(s.image_png(id).unwrap().unwrap(), b"png-a");
+        let text_id = s.search("text", 1).unwrap()[0].id;
+        assert_eq!(s.image_png(text_id).unwrap(), None);
     }
 
     #[test]

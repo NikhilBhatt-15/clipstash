@@ -232,6 +232,58 @@ impl Canvas {
     }
 }
 
+/// A decoded image ready for GDI+. GDI+ reads the pixels from `buf` directly,
+/// so the buffer lives as long as the bitmap.
+pub struct Bitmap {
+    _buf: Vec<u8>,
+    bmp: *mut GpBitmap,
+    pub w: i32,
+    pub h: i32,
+}
+
+impl Bitmap {
+    pub fn from_rgba(img: &crate::image::Rgba) -> Option<Self> {
+        let buf = crate::image::to_bgra(img);
+        let (w, h) = (img.w as i32, img.h as i32);
+        let mut bmp = null_mut();
+        let status = unsafe { GdipCreateBitmapFromScan0(w, h, w * 4, PIXEL_FORMAT_32BPP_ARGB, buf.as_ptr(), &mut bmp) };
+        (status == 0 && !bmp.is_null()).then_some(Bitmap { _buf: buf, bmp, w, h })
+    }
+
+    pub fn from_png(bytes: &[u8]) -> Option<Self> {
+        Self::from_rgba(&crate::image::decode_png(bytes)?)
+    }
+
+    /// Largest size that fits `max_w` x `max_h` keeping the aspect ratio,
+    /// never enlarged beyond `max_scale`.
+    pub fn fit(&self, max_w: i32, max_h: i32, max_scale: f32) -> (i32, i32) {
+        let scale = (max_w as f32 / self.w as f32).min(max_h as f32 / self.h as f32).min(max_scale);
+        (((self.w as f32 * scale).round() as i32).max(1), ((self.h as f32 * scale).round() as i32).max(1))
+    }
+}
+
+impl Drop for Bitmap {
+    fn drop(&mut self) {
+        unsafe { GdipDisposeImage(self.bmp as *mut GpImage) };
+    }
+}
+
+impl Canvas {
+    /// Draws `img` stretched into `r` with high-quality resampling, clipped to
+    /// rounded corners.
+    pub fn image(&self, img: &Bitmap, r: RECT, radius: i32) {
+        unsafe {
+            GdipSetInterpolationMode(self.g, InterpolationModeHighQualityBicubic);
+            let clip = Self::path(r, radius);
+            GdipSetClipPath(self.g, clip, CombineModeReplace);
+            GdipDrawImageRectI(self.g, img.bmp as *mut GpImage, r.left, r.top, r.right - r.left, r.bottom - r.top);
+            GdipResetClip(self.g);
+            GdipDeletePath(clip);
+            GdipFlush(self.g, FlushIntentionFlush);
+        }
+    }
+}
+
 fn fill_round(g: *mut GpGraphics, r: RECT, radius: i32, argb: u32) {
     unsafe {
         let p = Canvas::path(r, radius);
@@ -330,6 +382,7 @@ pub mod icon {
     pub const LINK: &str = "\u{E71B}";
     pub const FOLDER: &str = "\u{E8B7}";
     pub const PASTE: &str = "\u{E77F}";
+    pub const PICTURE: &str = "\u{E8B9}";
     pub const CHEVRON_LEFT: &str = "\u{E76B}";
     pub const CHEVRON_RIGHT: &str = "\u{E76C}";
 }

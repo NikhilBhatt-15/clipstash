@@ -9,6 +9,8 @@ pub enum Kind {
     Path,
     /// A CSS-style colour, with its RGB value for the swatch.
     Color(u8, u8, u8),
+    /// A copied image; never produced by `classify`, which only sees text.
+    Image,
 }
 
 impl Kind {
@@ -19,6 +21,7 @@ impl Kind {
             Kind::Link => "Link",
             Kind::Path => "Path",
             Kind::Color(..) => "Colour",
+            Kind::Image => "Image",
         }
     }
 

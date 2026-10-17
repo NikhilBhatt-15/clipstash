@@ -38,6 +38,8 @@ struct Entry {
     kind: Kind,
     lines: usize,
     title: Vec<char>,
+    /// Images: the stored list thumbnail, decoded.
+    thumb: Option<gfx::Bitmap>,
 }
 
 /// A line's characters and the char ranges of search hits in it.
@@ -53,6 +55,8 @@ struct Preview {
     text: String,
     /// (width, height) of `text` when wrapped, cached for scroll limits.
     wrapped: Option<(i32, i32)>,
+    /// Image entries: the full-size image.
+    image: Option<gfx::Bitmap>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -314,16 +318,29 @@ fn cancel() {
 
 fn choose(index: usize, action: Action) {
     let a = app();
-    let Some((id, text)) = with(|st| st.entries.get(index).map(|e| (e.clip.id, e.clip.text.clone()))) else { return };
-    let settings = a.settings.borrow().clone();
-    let mut out = match action {
-        Action::PasteTrimmed => classify::dedent(&text),
-        _ => text,
+    let Some((id, text, is_image)) =
+        with(|st| st.entries.get(index).map(|e| (e.clip.id, e.clip.text.clone(), e.clip.image.is_some())))
+    else {
+        return;
     };
-    if settings.normalize_line_endings {
-        out = classify::to_crlf(&out);
-    }
-    if !clipboard::write_text(a.main.get(), &out) {
+    let settings = a.settings.borrow().clone();
+    let written = if is_image {
+        // Trimming and line endings don't apply to images.
+        match a.store.image_png(id) {
+            Ok(Some(png)) => clipboard::write_image(a.main.get(), &a.formats, &png),
+            _ => false,
+        }
+    } else {
+        let mut out = match action {
+            Action::PasteTrimmed => classify::dedent(&text),
+            _ => text,
+        };
+        if settings.normalize_line_endings {
+            out = classify::to_crlf(&out);
+        }
+        clipboard::write_text(a.main.get(), &out)
+    };
+    if !written {
         return;
     }
     // Our own write triggers WM_CLIPBOARDUPDATE; recognise it by sequence number
@@ -346,12 +363,22 @@ fn refresh(keep: Keep) {
     let total = a.store.count().unwrap_or(clips.len());
     let entries: Vec<Entry> = clips
         .into_iter()
-        .map(|clip| Entry {
-            kind: classify::classify(&clip.text),
-            lines: classify::line_count(&clip.text),
-            // While searching, show the line that matched rather than the first line.
-            title: classify::title_matching(&clip.text, &terms, TITLE_CHARS).chars().collect(),
-            clip,
+        .map(|clip| match &clip.image {
+            Some(img) => Entry {
+                kind: Kind::Image,
+                lines: 1,
+                title: format!("Image {} × {}", img.w, img.h).chars().collect(),
+                thumb: gfx::Bitmap::from_png(&img.thumb),
+                clip,
+            },
+            None => Entry {
+                kind: classify::classify(&clip.text),
+                lines: classify::line_count(&clip.text),
+                // While searching, show the line that matched rather than the first line.
+                title: classify::title_matching(&clip.text, &terms, TITLE_CHARS).chars().collect(),
+                thumb: None,
+                clip,
+            },
         })
         .collect();
     with(|st| {
@@ -402,6 +429,10 @@ fn clamp_scroll(st: &mut State, l: &Layout) {
 }
 
 fn build_preview(e: &Entry, terms: &[Vec<char>]) -> Preview {
+    if e.kind == Kind::Image {
+        let image = app().store.image_png(e.clip.id).ok().flatten().and_then(|png| gfx::Bitmap::from_png(&png));
+        return Preview { id: e.clip.id, lines: Vec::new(), first_match: None, text: String::new(), wrapped: None, image };
+    }
     let mut text: String = e.clip.text.chars().take(PREVIEW_MAX_CHARS).collect();
     if text.len() < e.clip.text.len() {
         text.push_str("\n\n… (preview truncated)");
@@ -418,7 +449,7 @@ fn build_preview(e: &Entry, terms: &[Vec<char>]) -> Preview {
             lines.push((chars, hits));
         }
     }
-    Preview { id: e.clip.id, lines, first_match, text, wrapped: None }
+    Preview { id: e.clip.id, lines, first_match, text, wrapped: None, image: None }
 }
 
 fn invalidate() {
@@ -714,11 +745,23 @@ fn kind_icon(k: Kind) -> &'static str {
         Kind::Code => icon::CODE,
         Kind::Link => icon::LINK,
         Kind::Path => icon::FOLDER,
+        Kind::Image => icon::PICTURE,
         _ => icon::DOCUMENT,
     }
 }
 
+fn human_bytes(n: usize) -> String {
+    match n {
+        0..=1023 => format!("{n} B"),
+        1024..=1_048_575 => format!("{:.0} KB", n as f64 / 1024.0),
+        _ => format!("{:.1} MB", n as f64 / 1_048_576.0),
+    }
+}
+
 fn meta_line(e: &Entry, now: i64) -> String {
+    if let Some(img) = &e.clip.image {
+        return format!("Image · {} · {}", human_bytes(img.bytes), classify::relative_time(e.clip.used_ms, now));
+    }
     let size = if e.lines > 1 {
         format!("{} lines", e.lines)
     } else {
@@ -758,7 +801,7 @@ fn paint_list(c: &Canvas, t: &Theme, l: &Layout, st: &State) {
             (rect(l.list.left, cy - s(44), l.list.right, cy - s(4)), rect(l.list.left + s(16), cy + s(4), l.list.right - s(16), cy + s(60)))
         };
         let msg = if st.terms.is_empty() {
-            "No clipboard history yet.\nCopy some text and it will show up here."
+            "No clipboard history yet.\nCopy some text or take a screenshot and it will show up here."
         } else {
             "No matches."
         };
@@ -789,14 +832,22 @@ fn paint_list(c: &Canvas, t: &Theme, l: &Layout, st: &State) {
             c.round(rect(row.left, row.top + s(12), row.left + s(3), row.bottom - s(12)), s(2), t.accent);
         }
 
-        let icon_rect = rect(row.left + s(12), row.top, row.left + s(34), row.bottom);
+        // Wide enough for an image thumbnail; glyphs and swatches centre in it.
+        let icon_rect = rect(row.left + s(10), row.top, row.left + s(52), row.bottom);
         let (cx, cy) = ((icon_rect.left + icon_rect.right) / 2, (row.top + row.bottom) / 2);
-        match e.kind {
-            Kind::Color(r, g, b) => {
+        match (e.kind, &e.thumb) {
+            (Kind::Color(r, g, b), _) => {
                 c.circle(cx, cy, s(18), t.border);
                 c.circle(cx, cy, s(16), Rgb(r, g, b));
             }
-            k => c.text(kind_icon(k), icon_rect, f.icon, if selected { t.accent } else { t.subtext }, SINGLE | DT_CENTER),
+            // Thumbnail in a box a bit wider than the icon column, centred on it.
+            (Kind::Image, Some(thumb)) => {
+                let (w, h) = thumb.fit(s(40), s(32), f32::MAX);
+                let r = rect(cx - w / 2, cy - h / 2, cx - w / 2 + w, cy - h / 2 + h);
+                c.image(thumb, r, s(4));
+                c.round_stroke(r, s(4), t.border, 1.0);
+            }
+            (k, _) => c.text(kind_icon(k), icon_rect, f.icon, if selected { t.accent } else { t.subtext }, SINGLE | DT_CENTER),
         }
 
         let mut right = row.right - s(10);
@@ -843,6 +894,21 @@ fn paint_preview(c: &Canvas, t: &Theme, r: RECT, st: &mut State) {
 
     let mut scroll = st.preview_scroll;
     match e.kind {
+        // Scaled to fit (never enlarged past 1:1 pixels), centred.
+        Kind::Image => {
+            match &p.image {
+                Some(img) => {
+                    let (w, h) = img.fit(body.right - body.left, body_h, 1.0);
+                    let x = body.left + (body.right - body.left - w) / 2;
+                    let y = body.top + (body_h - h) / 2;
+                    let ir = rect(x, y, x + w, y + h);
+                    c.image(img, ir, s(6));
+                    c.round_stroke(ir, s(6), t.border, 1.0);
+                }
+                None => c.text("Couldn't load this image.", body, f.ui, t.subtext, SINGLE | DT_CENTER),
+            }
+            scroll = 0;
+        }
         Kind::Color(rr, gg, bb) => {
             let sw = rect(body.left, body.top, body.left + s(96), body.top + s(96));
             c.round(sw, s(12), Rgb(rr, gg, bb));
@@ -904,15 +970,17 @@ fn paint_preview(c: &Canvas, t: &Theme, r: RECT, st: &mut State) {
     c.fill(rect(r.left, body.bottom, r.right, r.bottom), t.inset);
     c.fill(rect(r.left, r.top, r.left + 1, r.bottom), t.border);
     let e = &st.entries[st.selected];
-    let chars = e.clip.text.chars().count();
-    let mut info = format!(
-        "{} · {} line{} · {} chars · {}",
-        e.kind.label(),
-        e.lines,
-        if e.lines == 1 { "" } else { "s" },
-        chars,
-        classify::relative_time(e.clip.used_ms, now_ms())
-    );
+    let when = classify::relative_time(e.clip.used_ms, now_ms());
+    let mut info = match &e.clip.image {
+        Some(img) => format!("Image · {} × {} px · {} PNG · {when}", img.w, img.h, human_bytes(img.bytes)),
+        None => format!(
+            "{} · {} line{} · {} chars · {when}",
+            e.kind.label(),
+            e.lines,
+            if e.lines == 1 { "" } else { "s" },
+            e.clip.text.chars().count(),
+        ),
+    };
     if e.clip.pinned {
         info.push_str(" · Pinned");
     }
@@ -935,12 +1003,14 @@ fn paint_footer(c: &Canvas, t: &Theme, l: &Layout, st: &State, paste_on_enter: b
     c.text(&count, rect(r.right - s(14) - count_w, r.top, r.right - s(14), r.bottom), f.small, t.subtext, SINGLE | DT_RIGHT);
 
     let (enter, shift_enter) = if paste_on_enter { ("Paste", "Paste trimmed") } else { ("Copy", "Copy trimmed") };
+    // Trimming only means something for text.
+    let image_selected = st.entries.get(st.selected).is_some_and(|e| e.kind == Kind::Image);
     let hints = [("Enter", enter), ("Shift+Enter", shift_enter), ("Ctrl+Enter", "Copy"), ("Ctrl+P", "Pin"), ("Shift+Del", "Delete")];
     let limit = r.right - s(28) - count_w;
     let mut x = r.left + s(12);
     let pill_h = f.small_h + s(4);
     let py = (r.top + r.bottom - pill_h) / 2 + 1;
-    for (key, label) in hints {
+    for (key, label) in hints.into_iter().filter(|(k, _)| !(image_selected && *k == "Shift+Enter")) {
         let kw = c.extent(&gfx::wide(key), f.small) + s(10);
         let lw = c.extent(&gfx::wide(label), f.small);
         if x + kw + s(6) + lw > limit {

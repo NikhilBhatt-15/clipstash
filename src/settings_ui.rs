@@ -7,7 +7,7 @@
 
 use crate::gfx::{self, contains, icon, rect, Canvas, Fonts};
 use crate::hotkey::{self, Hotkey};
-use crate::settings::{Settings, FONT_SIZES, HISTORY_SIZES, POSITIONS, THEMES};
+use crate::settings::{Settings, FONT_SIZES, HISTORY_SIZES, IMAGE_HISTORY_SIZES, POSITIONS, THEMES};
 use crate::theme::Theme;
 use crate::app;
 use std::cell::RefCell;
@@ -33,6 +33,8 @@ enum Item {
     PasteOnEnter,
     NormalizeEol,
     HistorySize,
+    SaveImages,
+    ImageHistory,
     RespectPrivacy,
     ClearHistory,
     StartWithWindows,
@@ -50,7 +52,7 @@ enum Ctl {
 const SECTIONS: &[(&str, &[Item])] = &[
     ("Appearance", &[Item::Theme, Item::FontSize, Item::ShowPreview, Item::Position]),
     ("Shortcut & pasting", &[Item::Hotkey, Item::PasteOnEnter, Item::NormalizeEol]),
-    ("History", &[Item::HistorySize, Item::RespectPrivacy, Item::ClearHistory]),
+    ("History", &[Item::HistorySize, Item::SaveImages, Item::ImageHistory, Item::RespectPrivacy, Item::ClearHistory]),
     ("System", &[Item::StartWithWindows, Item::OpenFolder]),
 ];
 
@@ -64,7 +66,9 @@ impl Item {
             Item::Hotkey => "Shortcut",
             Item::PasteOnEnter => "Paste into the active app",
             Item::NormalizeEol => "Windows line endings",
-            Item::HistorySize => "Keep history",
+            Item::HistorySize => "Keep text",
+            Item::SaveImages => "Save images",
+            Item::ImageHistory => "Keep images",
             Item::RespectPrivacy => "Ignore password managers",
             Item::ClearHistory => "Clear history",
             Item::StartWithWindows => "Start with Windows",
@@ -82,6 +86,8 @@ impl Item {
             Item::PasteOnEnter => "When off, Enter only copies to the clipboard",
             Item::NormalizeEol => "Convert LF line endings to CRLF when pasting",
             Item::HistorySize => "Pinned items are always kept",
+            Item::SaveImages => "Screenshots and copied pictures",
+            Item::ImageHistory => "Kept separately from text; images take more space",
             Item::RespectPrivacy => "Skip copies marked private, e.g. passwords",
             Item::ClearHistory => "Deletes everything except pinned items",
             Item::StartWithWindows => "Launch clipstash when you sign in",
@@ -91,7 +97,7 @@ impl Item {
 
     fn ctl(self) -> Ctl {
         match self {
-            Item::Theme | Item::FontSize | Item::Position | Item::HistorySize => Ctl::Choice,
+            Item::Theme | Item::FontSize | Item::Position | Item::HistorySize | Item::ImageHistory => Ctl::Choice,
             Item::Hotkey => Ctl::Shortcut,
             Item::ClearHistory | Item::OpenFolder => Ctl::Button,
             _ => Ctl::Toggle,
@@ -104,6 +110,7 @@ impl Item {
             Item::PasteOnEnter => s.paste_on_enter,
             Item::NormalizeEol => s.normalize_line_endings,
             Item::RespectPrivacy => s.respect_privacy,
+            Item::SaveImages => s.save_images,
             Item::StartWithWindows => s.start_with_windows,
             _ => false,
         }
@@ -115,6 +122,7 @@ impl Item {
             Item::PasteOnEnter => s.paste_on_enter ^= true,
             Item::NormalizeEol => s.normalize_line_endings ^= true,
             Item::RespectPrivacy => s.respect_privacy ^= true,
+            Item::SaveImages => s.save_images ^= true,
             Item::StartWithWindows => s.start_with_windows ^= true,
             _ => {}
         }
@@ -131,6 +139,7 @@ impl Item {
             }
             .into(),
             Item::HistorySize => format!("{} items", s.max_history),
+            Item::ImageHistory => format!("{} images", s.max_images),
             Item::Hotkey => s.hotkey.clone(),
             Item::ClearHistory => "Clear…".into(),
             Item::OpenFolder => "Open".into(),
@@ -148,13 +157,17 @@ impl Item {
             Item::Theme => s.theme = cycle(THEMES, &s.theme, dir),
             Item::Position => s.position = cycle(POSITIONS, &s.position, dir),
             Item::FontSize => s.font_size = (s.font_size as i32 + dir).clamp(*FONT_SIZES.start() as i32, *FONT_SIZES.end() as i32) as u32,
-            Item::HistorySize => {
-                let i = HISTORY_SIZES.iter().position(|&n| n >= s.max_history).unwrap_or(HISTORY_SIZES.len() - 1) as i32;
-                s.max_history = HISTORY_SIZES[(i + dir).clamp(0, HISTORY_SIZES.len() as i32 - 1) as usize];
-            }
+            Item::HistorySize => s.max_history = step_in(HISTORY_SIZES, s.max_history, dir),
+            Item::ImageHistory => s.max_images = step_in(IMAGE_HISTORY_SIZES, s.max_images, dir),
             _ => {}
         }
     }
+}
+
+/// Next value in `list` from `cur` (which may be a hand-edited value not in it).
+fn step_in(list: &[u32], cur: u32, dir: i32) -> u32 {
+    let i = list.iter().position(|&n| n >= cur).unwrap_or(list.len() - 1) as i32;
+    list[(i + dir).clamp(0, list.len() as i32 - 1) as usize]
 }
 
 fn theme_label(name: &str) -> &'static str {

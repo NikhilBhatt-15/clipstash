@@ -12,6 +12,7 @@ mod clipboard;
 mod focus;
 mod gfx;
 mod hotkey;
+mod image;
 mod popup;
 mod settings;
 mod settings_ui;
@@ -43,6 +44,8 @@ const TIMER_CAPTURE: usize = 1;
 /// notification. The source app often still has the clipboard open, or is
 /// about to add more formats.
 const CAPTURE_DELAY_MS: u32 = 75;
+/// Longer side of the stored list thumbnail; covers ~3x DPI scaling.
+const THUMB_PX: u32 = 144;
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 
 /// UI-thread state. Everything runs on one thread, so plain Cells suffice.
@@ -58,7 +61,7 @@ pub struct App {
     pub dir: PathBuf,
     /// Clipboard sequence number of our own last write, so it isn't re-recorded.
     pub ignore_seq: Cell<u32>,
-    pub opt_out: clipboard::OptOutFormats,
+    pub formats: clipboard::Formats,
 }
 
 thread_local! {
@@ -115,6 +118,9 @@ pub fn apply_settings(new: Settings) {
     if old.max_history != new.max_history {
         let _ = a.store.set_keep(new.max_history as usize);
     }
+    if old.max_images != new.max_images {
+        let _ = a.store.set_keep_images(new.max_images as usize);
+    }
     if old.start_with_windows != new.start_with_windows && !settings::autostart::set(new.start_with_windows) {
         a.settings.borrow_mut().start_with_windows = settings::autostart::enabled();
     }
@@ -150,6 +156,7 @@ fn main() {
             return;
         }
     };
+    let _ = store.set_keep_images(settings.max_images as usize);
 
     let state: &'static App = Box::leak(Box::new(App {
         main: Cell::new(null_mut()),
@@ -161,7 +168,7 @@ fn main() {
         settings: RefCell::new(settings),
         dir,
         ignore_seq: Cell::new(0),
-        opt_out: clipboard::OptOutFormats::register(),
+        formats: clipboard::Formats::register(),
     }));
     APP.with(|a| a.set(state).ok());
 
@@ -211,9 +218,21 @@ fn capture() {
     if unsafe { GetClipboardSequenceNumber() } == a.ignore_seq.get() {
         return;
     }
-    let respect_privacy = a.settings.borrow().respect_privacy;
-    if let Some(text) = clipboard::read_text(a.main.get(), &a.opt_out, respect_privacy) {
-        let _ = a.store.add(&text);
+    let (respect_privacy, save_images) = {
+        let s = a.settings.borrow();
+        (s.respect_privacy, s.save_images)
+    };
+    match clipboard::read(a.main.get(), &a.formats, respect_privacy, save_images) {
+        Some(clipboard::Content::Text(text)) => {
+            let _ = a.store.add(&text);
+        }
+        Some(clipboard::Content::Image { img, png }) => {
+            // Keep the source PNG when there is one; otherwise encode the bitmap.
+            let Some(png) = png.or_else(|| image::encode_png(&img)) else { return };
+            let Some(thumb) = image::encode_png(&image::thumbnail(&img, THUMB_PX)) else { return };
+            let _ = a.store.add_image(&png, &thumb, img.w, img.h, image::content_hash(&img));
+        }
+        None => {}
     }
 }
 

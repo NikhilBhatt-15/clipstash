@@ -9,16 +9,21 @@ pub const THEMES: &[&str] = &["system", "light", "dark", "nord", "dracula", "cat
 pub const POSITIONS: &[&str] = &["caret", "mouse", "center"];
 pub const FONT_SIZES: std::ops::RangeInclusive<u32> = 8..=16;
 pub const HISTORY_SIZES: &[u32] = &[50, 100, 200, 500, 1000, 2000, 5000];
+pub const IMAGE_HISTORY_SIZES: &[u32] = &[10, 25, 50, 100, 250];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// One of THEMES. "system" follows Windows light/dark mode and accent colour.
     pub theme: String,
-    /// Global shortcut, e.g. "Ctrl+Shift+V".
+    /// Global shortcut, e.g. "Win+Alt+V".
     pub hotkey: String,
-    /// Unpinned entries kept; pinned entries are never pruned.
+    /// Unpinned text entries kept; pinned entries are never pruned.
     pub max_history: u32,
+    /// Record copied images (screenshots etc.).
+    pub save_images: bool,
+    /// Unpinned images kept, separately from text since they are much larger.
+    pub max_images: u32,
     /// UI font size in points.
     pub font_size: u32,
     /// Show the full-text preview pane next to the list.
@@ -41,6 +46,8 @@ impl Default for Settings {
             theme: "system".into(),
             hotkey: Hotkey::default().display(),
             max_history: 500,
+            save_images: true,
+            max_images: 50,
             font_size: 10,
             show_preview: true,
             position: "caret".into(),
@@ -86,6 +93,7 @@ impl Settings {
         }
         self.font_size = self.font_size.clamp(*FONT_SIZES.start(), *FONT_SIZES.end());
         self.max_history = self.max_history.clamp(10, 100_000);
+        self.max_images = self.max_images.clamp(1, 10_000);
     }
 
     pub fn hotkey(&self) -> Hotkey {
@@ -132,8 +140,10 @@ mod tests {
         assert_eq!(s.theme, "system");
         assert_eq!(s.font_size, 16);
         assert!(!s.show_preview);
-        assert_eq!(s.hotkey, "Ctrl+Shift+V");
+        assert_eq!(s.hotkey, "Win+Alt+V");
         assert_eq!(s.max_history, 500);
+        assert!(s.save_images);
+        assert_eq!(s.max_images, 50);
     }
 
     #[test]

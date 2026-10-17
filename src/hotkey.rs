@@ -12,9 +12,12 @@ pub struct Hotkey {
     pub vk: u32,
 }
 
+/// Win+Alt+V: next to Windows' own clipboard history (Win+V), and apps don't
+/// bind Win-key shortcuts, so it doesn't shadow anything inside them (unlike
+/// Ctrl+Shift+V, which is "paste as plain text" in browsers and editors).
 impl Default for Hotkey {
     fn default() -> Self {
-        Self { mods: MOD_CONTROL | MOD_SHIFT, vk: b'V' as u32 }
+        Self { mods: MOD_WIN | MOD_ALT, vk: b'V' as u32 }
     }
 }
 
@@ -105,7 +108,8 @@ impl Hotkey {
 
     pub fn display(&self) -> String {
         let mut parts = Vec::new();
-        for (m, n) in [(MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift"), (MOD_WIN, "Win")] {
+        // Windows' own order: Win+Ctrl+Alt+Shift+key.
+        for (m, n) in [(MOD_WIN, "Win"), (MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift")] {
             if self.mods & m != 0 {
                 parts.push(n.to_string());
             }
@@ -121,7 +125,7 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        for s in ["Ctrl+Shift+V", "Alt+Space", "Ctrl+Alt+F12", "Win+`", "Ctrl+Shift+0", "Ctrl+PageDown"] {
+        for s in ["Win+Alt+V", "Ctrl+Shift+V", "Alt+Space", "Ctrl+Alt+F12", "Win+`", "Ctrl+Shift+0", "Ctrl+PageDown"] {
             let hk = Hotkey::parse(s).unwrap();
             assert_eq!(hk.display(), s);
         }
@@ -131,6 +135,8 @@ mod tests {
     fn parsing_is_lenient_on_case_and_order() {
         assert_eq!(Hotkey::parse("shift + ctrl + v"), Hotkey::parse("Ctrl+Shift+V"));
         assert_eq!(Hotkey::parse("control+alt+f1").unwrap().display(), "Ctrl+Alt+F1");
+        assert_eq!(Hotkey::parse("alt+win+v").unwrap().display(), "Win+Alt+V");
+        assert_eq!(Hotkey::default().display(), "Win+Alt+V");
     }
 
     #[test]

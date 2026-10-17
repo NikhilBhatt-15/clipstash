@@ -92,9 +92,10 @@ fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
 
 /// Sends Ctrl+V to whatever has keyboard focus.
 pub fn send_paste() {
-    // Wait (briefly) for the user to let go of Shift/Alt/Win. Otherwise the
-    // target would see Ctrl+Shift+V or Alt+Ctrl+V; Ctrl+Shift+V would even
-    // trigger our own hotkey again.
+    // Wait (briefly) for the user to let go of Shift/Alt/Win, which are often
+    // still held from the hotkey. Otherwise the target would see e.g.
+    // Win+Alt+Ctrl+V or Ctrl+Shift+V instead of a plain paste, or our own
+    // hotkey could fire again.
     for _ in 0..75 {
         if ![VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN].into_iter().any(key_down) {
             break;
